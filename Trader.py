@@ -39,8 +39,6 @@ class Trader:
         fair_value = 10000
         limit = self.LIMITS["EMERALDS"]
 
-        # Stationary Product ==> Buy low (<10000), sell high (>10000) 
-
         # Track how much we've bought and sold this tick 
         buy_volume = 0 
         sell_volume = 0
@@ -68,10 +66,9 @@ class Trader:
                         sell_volume += qty
         
         # STEP 2: CLEAR 
-        # Make inventory stable around fair value 
         position_after_take = position + buy_volume - sell_volume
 
-        # Long
+        # Long - sell at fair value to reduce
         if position_after_take > 0: 
             can_sell = limit + (position - sell_volume)
             qty = min(position_after_take, can_sell)
@@ -79,7 +76,7 @@ class Trader:
                orders.append(Order("EMERALDS", fair_value, -qty))
                sell_volume += qty
         
-        # Short 
+        # Short - buy at fair value to reduce
         elif position_after_take < 0: 
             can_buy = limit - (position + buy_volume)
             qty = min(-position_after_take, can_buy)
@@ -87,22 +84,30 @@ class Trader:
                 orders.append(Order("EMERALDS", fair_value, qty))
                 buy_volume += qty 
 
-        # STEP 3: MAKE 
-        # Place passive orders around fair value 
+        # STEP 3: MAKE (with inventory skewing)
+        spread = 4
         
-        spread = 8 # Spread is 8 for Emeralds data (best ask - best bid) 
+        # Skew quotes based on inventory - shift both prices to encourage flattening
+        skew = round(position * 0.1)
+        
+        buy_price = fair_value - spread - skew
+        sell_price = fair_value + spread - skew
+
+        # Reduce size when inventory is high
+        inv_ratio = abs(position) / limit
+        size_mult = max(0.2, 1.0 - inv_ratio)
 
         # Passive buy order
-        buy_price = fair_value - spread
         can_buy = limit - (position + buy_volume)
-        if can_buy > 0:
-            orders.append(Order("EMERALDS", buy_price, can_buy))
+        buy_qty = round(can_buy * size_mult) # buy + sell quantity 
+        if buy_qty > 0:
+            orders.append(Order("EMERALDS", buy_price, buy_qty))
 
         # Passive sell order
-        sell_price = fair_value + spread
         can_sell = limit + (position - sell_volume)
-        if can_sell > 0:
-            orders.append(Order("EMERALDS", sell_price, -can_sell))
+        sell_qty = round(can_sell * size_mult)
+        if sell_qty > 0:
+            orders.append(Order("EMERALDS", sell_price, -sell_qty))
 
         return orders
     
@@ -110,20 +115,28 @@ class Trader:
         orders: List[Order] = []
         limit = self.LIMITS["TOMATOES"]
 
-        # Calculate mid price
+        # Wall mid price - use level 2 prices for more stable fair value estimate
         best_bid = max(order_depth.buy_orders.keys())
         best_ask = min(order_depth.sell_orders.keys())
-        mid_price = (best_bid + best_ask) / 2
+        
+        # Get level 2 prices if available
+        bid_prices = sorted(order_depth.buy_orders.keys(), reverse=True)
+        ask_prices = sorted(order_depth.sell_orders.keys())
+        
+        if len(bid_prices) >= 2 and len(ask_prices) >= 2:
+            wall_mid = (bid_prices[1] + ask_prices[1]) / 2
+        else:
+            wall_mid = (best_bid + best_ask) / 2
 
         # EMA as dynamic fair value
-        ema_span = 8
+        ema_span = 5
         alpha = 2 / (ema_span + 1)
 
         if "tomatoes_ema" in trader_data:
             ema = trader_data["tomatoes_ema"]
-            ema = alpha * mid_price + (1 - alpha) * ema
+            ema = alpha * wall_mid + (1 - alpha) * ema
         else:
-            ema = mid_price
+            ema = wall_mid
 
         trader_data["tomatoes_ema"] = ema
         fair_value = round(ema)
@@ -168,23 +181,29 @@ class Trader:
                 orders.append(Order("TOMATOES", fair_value, qty))
                 buy_volume += qty
 
-        # STEP 3: MAKE
-        spread = 6
+        # STEP 3: MAKE with inventory skewing
+        spread = 4
+        
+        # Skew quotes based on inventory
+        skew = round(position * 0.15)
+        
+        buy_price = fair_value - spread - skew
+        sell_price = fair_value + spread - skew
 
-        buy_price = fair_value - spread
+        # Reduce size when inventory is high
+        inv_ratio = abs(position) / limit
+        size_mult = max(0.2, 1.0 - inv_ratio)
+
+        # Passive buy order
         can_buy = limit - (position + buy_volume)
-        if can_buy > 0:
-            orders.append(Order("TOMATOES", buy_price, can_buy))
+        buy_qty = round(can_buy * size_mult)
+        if buy_qty > 0:
+            orders.append(Order("TOMATOES", buy_price, buy_qty))
 
-        sell_price = fair_value + spread
+        # Passive sell order
         can_sell = limit + (position - sell_volume)
-        if can_sell > 0:
-            orders.append(Order("TOMATOES", sell_price, -can_sell))
+        sell_qty = round(can_sell * size_mult)
+        if sell_qty > 0:
+            orders.append(Order("TOMATOES", sell_price, -sell_qty))
 
         return orders, trader_data
-
-
-
-    
-
-

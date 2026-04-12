@@ -1,0 +1,483 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>IMC Prosperity 4 — Log Viewer</title>
+<style>
+@import url('https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=DM+Sans:wght@400;500;700&display=swap');
+
+:root {
+  --bg: #080c14;
+  --surface: #0e1420;
+  --surface2: #131b2a;
+  --border: #1c2740;
+  --text: #c8d0e0;
+  --muted: #5a6680;
+  --accent: #3b82f6;
+  --green: #22c55e;
+  --red: #ef4444;
+  --amber: #f59e0b;
+  --cyan: #06b6d4;
+  --mono: 'IBM Plex Mono', monospace;
+  --sans: 'DM Sans', sans-serif;
+}
+
+* { margin: 0; padding: 0; box-sizing: border-box; }
+
+body {
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--sans);
+  line-height: 1.5;
+  overflow-x: hidden;
+}
+
+.topbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 14px 28px;
+  border-bottom: 1px solid var(--border);
+  background: var(--surface);
+}
+.topbar-left { display: flex; align-items: center; gap: 14px; }
+.topbar-left .logo {
+  font-family: var(--mono);
+  font-weight: 600;
+  font-size: 15px;
+  color: var(--accent);
+  letter-spacing: -0.5px;
+}
+.topbar-left .sep { color: var(--border); }
+.topbar-left .round-badge {
+  font-family: var(--mono);
+  font-size: 12px;
+  background: var(--surface2);
+  border: 1px solid var(--border);
+  padding: 3px 10px;
+  border-radius: 4px;
+  color: var(--muted);
+}
+.topbar-right .final-pnl {
+  font-family: var(--mono);
+  font-size: 18px;
+  font-weight: 600;
+}
+
+.upload-screen {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: calc(100vh - 52px);
+}
+.upload-screen.hidden { display: none; }
+
+.drop-zone {
+  width: 480px;
+  border: 2px dashed var(--border);
+  border-radius: 12px;
+  padding: 56px 32px;
+  text-align: center;
+  cursor: pointer;
+  transition: border-color .2s, background .2s;
+}
+.drop-zone:hover, .drop-zone.dragover {
+  border-color: var(--accent);
+  background: rgba(59,130,246,0.04);
+}
+.drop-zone .icon { font-size: 36px; margin-bottom: 14px; opacity: .7; }
+.drop-zone h2 { font-size: 16px; font-weight: 700; margin-bottom: 6px; }
+.drop-zone p { font-size: 13px; color: var(--muted); }
+input[type="file"] { display: none; }
+
+.dashboard { display: none; }
+.dashboard.visible { display: block; }
+
+.grid-main {
+  display: grid;
+  gap: 16px;
+  padding: 20px 28px;
+}
+
+.stats-strip {
+  display: grid;
+  grid-template-columns: repeat(6, 1fr);
+  gap: 12px;
+}
+.s-card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 14px 16px;
+}
+.s-card .s-label {
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 1.2px;
+  color: var(--muted);
+  font-family: var(--mono);
+  margin-bottom: 4px;
+}
+.s-card .s-val {
+  font-size: 20px;
+  font-weight: 600;
+  font-family: var(--mono);
+}
+.s-val.up { color: var(--green); }
+.s-val.dn { color: var(--red); }
+.s-val.neut { color: var(--cyan); }
+
+.chart-panel {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 18px 20px;
+}
+.chart-panel h3 {
+  font-family: var(--mono);
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: .8px;
+  margin-bottom: 10px;
+}
+canvas { display: block; }
+
+.charts-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 16px;
+}
+
+.table-panel {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 18px 20px;
+}
+.table-panel h3 {
+  font-family: var(--mono);
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: .8px;
+  margin-bottom: 10px;
+}
+
+.toolbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 12px;
+}
+.pill {
+  font-family: var(--mono);
+  font-size: 11px;
+  padding: 4px 14px;
+  border-radius: 4px;
+  cursor: pointer;
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--muted);
+  transition: all .15s;
+}
+.pill:hover { border-color: var(--accent); color: var(--text); }
+.pill.on { background: rgba(59,130,246,.12); border-color: var(--accent); color: var(--accent); }
+
+.scroll-wrap {
+  max-height: 420px;
+  overflow-y: auto;
+  scrollbar-width: thin;
+  scrollbar-color: var(--border) transparent;
+}
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+  font-family: var(--mono);
+  font-size: 11px;
+}
+th {
+  text-align: left;
+  padding: 7px 8px;
+  border-bottom: 1px solid var(--border);
+  color: var(--accent);
+  font-weight: 600;
+  position: sticky;
+  top: 0;
+  background: var(--surface);
+  z-index: 1;
+}
+td {
+  padding: 5px 8px;
+  border-bottom: 1px solid rgba(28,39,64,.4);
+  color: var(--text);
+}
+tr:hover td { background: var(--surface2); }
+
+.bottom-grid {
+  display: grid;
+  grid-template-columns: 280px 1fr;
+  gap: 16px;
+}
+
+.page-controls {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 10px;
+}
+.page-controls button {
+  font-family: var(--mono);
+  font-size: 11px;
+  padding: 4px 12px;
+  border-radius: 4px;
+  cursor: pointer;
+  border: 1px solid var(--border);
+  background: var(--surface2);
+  color: var(--text);
+}
+.page-controls button:disabled { opacity: .35; cursor: default; }
+.page-controls span { font-family: var(--mono); font-size: 11px; color: var(--muted); }
+
+@media (max-width: 900px) {
+  .stats-strip { grid-template-columns: repeat(3, 1fr); }
+  .charts-grid { grid-template-columns: 1fr; }
+  .bottom-grid { grid-template-columns: 1fr; }
+}
+</style>
+</head>
+<body>
+
+<div class="topbar">
+  <div class="topbar-left">
+    <span class="logo">prosperity4::log</span>
+    <span class="sep">|</span>
+    <span class="round-badge" id="roundBadge">—</span>
+  </div>
+  <div class="topbar-right">
+    <span class="final-pnl" id="topPnl"></span>
+  </div>
+</div>
+
+<div class="upload-screen" id="uploadScreen">
+  <div class="drop-zone" id="dropZone">
+    <div class="icon">&#x2B06;</div>
+    <h2>Load IMC log</h2>
+    <p>Drop a .json log file here, or click to browse</p>
+  </div>
+  <input type="file" id="fileInput" accept=".json">
+</div>
+
+<div class="dashboard" id="dash">
+  <div class="grid-main">
+    <div class="stats-strip" id="stats"></div>
+    <div class="chart-panel">
+      <h3>Cumulative PnL</h3>
+      <canvas id="cvPnl" height="220"></canvas>
+    </div>
+    <div class="charts-grid" id="midCharts"></div>
+    <div class="bottom-grid">
+      <div class="table-panel">
+        <h3>Final Positions</h3>
+        <div id="posTable"></div>
+      </div>
+      <div class="table-panel">
+        <h3>Order Book Snapshots</h3>
+        <div class="toolbar" id="toolbar"></div>
+        <div class="scroll-wrap" id="bookWrap"></div>
+        <div class="page-controls" id="pageCtrl"></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+const dropZone = document.getElementById('dropZone');
+const fileInput = document.getElementById('fileInput');
+dropZone.addEventListener('click', () => fileInput.click());
+dropZone.addEventListener('dragover', e => { e.preventDefault(); dropZone.classList.add('dragover'); });
+dropZone.addEventListener('dragleave', () => dropZone.classList.remove('dragover'));
+dropZone.addEventListener('drop', e => {
+  e.preventDefault();
+  dropZone.classList.remove('dragover');
+  if (e.dataTransfer.files.length) loadFile(e.dataTransfer.files[0]);
+});
+fileInput.addEventListener('change', e => { if (e.target.files.length) loadFile(e.target.files[0]); });
+
+function loadFile(file) {
+  const reader = new FileReader();
+  reader.onload = ev => {
+    try { boot(JSON.parse(ev.target.result)); }
+    catch(err) { alert('Parse error: ' + err.message); }
+  };
+  reader.readAsText(file);
+}
+
+let allRows = [], products = [], activeProducts = new Set(), page = 0;
+const PAGE_SIZE = 150;
+const CHART_COLORS = ['#06b6d4','#f59e0b','#a78bfa','#f472b6','#34d399','#fb923c'];
+
+function boot(data) {
+  document.getElementById('uploadScreen').classList.add('hidden');
+  document.getElementById('dash').classList.add('visible');
+  document.getElementById('roundBadge').textContent = 'Round ' + data.round + '  ·  ' + data.status;
+  const pnlEl = document.getElementById('topPnl');
+  pnlEl.textContent = (data.profit >= 0 ? '+' : '') + data.profit.toFixed(2);
+  pnlEl.style.color = data.profit >= 0 ? 'var(--green)' : 'var(--red)';
+
+  const aLines = data.activitiesLog.split('\n').filter(l => l.trim());
+  const hdr = aLines[0].split(';');
+  allRows = aLines.slice(1).map(l => {
+    const v = l.split(';');
+    const o = {};
+    hdr.forEach((h, i) => o[h] = v[i] || '');
+    return o;
+  });
+  products = [...new Set(allRows.map(r => r.product))];
+  activeProducts = new Set(products);
+
+  const gLines = data.graphLog.split('\n').filter(l => l.trim());
+  const graph = gLines.slice(1).map(l => { const [t,v] = l.split(';'); return {t:+t,v:+v}; });
+
+  const maxPnl = Math.max(...graph.map(g => g.v));
+  const minPnl = Math.min(...graph.map(g => g.v));
+  let peak = -Infinity, maxDD = 0;
+  graph.forEach(g => { if(g.v>peak) peak=g.v; const dd=peak-g.v; if(dd>maxDD) maxDD=dd; });
+  const rets = [];
+  for(let i=1;i<graph.length;i++) rets.push(graph[i].v - graph[i-1].v);
+  const mu = rets.reduce((a,b)=>a+b,0)/rets.length;
+  const sd = Math.sqrt(rets.reduce((a,b)=>a+(b-mu)**2,0)/rets.length);
+  const sharpe = sd > 0 ? (mu/sd*Math.sqrt(rets.length)).toFixed(2) : '—';
+
+  document.getElementById('stats').innerHTML = [
+    card('Final PnL', fmt(data.profit), data.profit>=0?'up':'dn'),
+    card('Peak', fmt(maxPnl), 'up'),
+    card('Trough', fmt(minPnl), minPnl>=0?'up':'dn'),
+    card('Max Drawdown', fmt(maxDD), 'dn'),
+    card('Sharpe (approx)', sharpe, 'neut'),
+    card('Ticks', graph.length.toString(), 'neut'),
+  ].join('');
+
+  drawLine('cvPnl', graph.map(g=>g.t), graph.map(g=>g.v), '#3b82f6', true);
+
+  // Mid-price charts — one per product, dynamically
+  const midDiv = document.getElementById('midCharts');
+  midDiv.innerHTML = '';
+  products.forEach((p, i) => {
+    const panel = document.createElement('div');
+    panel.className = 'chart-panel';
+    panel.innerHTML = '<h3>Mid Price — ' + p + '</h3><canvas id="cvMid'+i+'" height="180"></canvas>';
+    midDiv.appendChild(panel);
+  });
+  products.forEach((p, i) => {
+    const subset = allRows.filter(r => r.product === p);
+    drawLine('cvMid'+i, subset.map(r=>+r.timestamp), subset.map(r=>+r.mid_price), CHART_COLORS[i % CHART_COLORS.length], false);
+  });
+
+  document.getElementById('posTable').innerHTML =
+    '<table><tr><th>Symbol</th><th>Qty</th></tr>' +
+    data.positions.map(p =>
+      '<tr><td>'+p.symbol+'</td><td style="color:'+(p.quantity>0?'var(--green)':p.quantity<0?'var(--red)':'var(--text)')+'">'+p.quantity+'</td></tr>'
+    ).join('') + '</table>';
+
+  const tb = document.getElementById('toolbar');
+  tb.innerHTML = products.map(p =>
+    '<button class="pill on" data-p="'+p+'">'+p+'</button>'
+  ).join('');
+  tb.querySelectorAll('.pill').forEach(btn => {
+    btn.addEventListener('click', () => {
+      const p = btn.dataset.p;
+      btn.classList.toggle('on');
+      activeProducts.has(p) ? activeProducts.delete(p) : activeProducts.add(p);
+      page = 0;
+      renderTable();
+    });
+  });
+  renderTable();
+}
+
+function renderTable() {
+  const filtered = allRows.filter(r => activeProducts.has(r.product));
+  const totalPages = Math.max(1, Math.ceil(filtered.length / PAGE_SIZE));
+  const slice = filtered.slice(page * PAGE_SIZE, (page+1) * PAGE_SIZE);
+  document.getElementById('bookWrap').innerHTML =
+    '<table><tr><th>Day</th><th>T</th><th>Product</th><th>B1</th><th>BV1</th><th>B2</th><th>BV2</th><th>B3</th><th>BV3</th><th>A1</th><th>AV1</th><th>A2</th><th>AV2</th><th>A3</th><th>AV3</th><th>Mid</th><th>PnL</th></tr>' +
+    slice.map(r =>
+      '<tr><td>'+r.day+'</td><td>'+r.timestamp+'</td><td>'+r.product+'</td>' +
+      '<td>'+r.bid_price_1+'</td><td>'+r.bid_volume_1+'</td>' +
+      '<td>'+r.bid_price_2+'</td><td>'+r.bid_volume_2+'</td>' +
+      '<td>'+(r.bid_price_3||'')+'</td><td>'+(r.bid_volume_3||'')+'</td>' +
+      '<td>'+r.ask_price_1+'</td><td>'+r.ask_volume_1+'</td>' +
+      '<td>'+r.ask_price_2+'</td><td>'+r.ask_volume_2+'</td>' +
+      '<td>'+(r.ask_price_3||'')+'</td><td>'+(r.ask_volume_3||'')+'</td>' +
+      '<td>'+r.mid_price+'</td>' +
+      '<td style="color:'+(+r.profit_and_loss>0?'var(--green)':+r.profit_and_loss<0?'var(--red)':'var(--text)')+'">'+((+r.profit_and_loss)||0).toFixed(1)+'</td></tr>'
+    ).join('') + '</table>';
+  document.getElementById('pageCtrl').innerHTML =
+    '<button '+(page===0?'disabled':'')+' onclick="page--;renderTable()">Prev</button>' +
+    '<span>'+(page+1)+' / '+totalPages+'</span>' +
+    '<button '+(page>=totalPages-1?'disabled':'')+' onclick="page++;renderTable()">Next</button>' +
+    '<span style="margin-left:12px">'+filtered.length+' rows</span>';
+}
+
+function drawLine(id, xs, ys, color, fill) {
+  const cv = document.getElementById(id);
+  if (!cv) return;
+  const ctx = cv.getContext('2d');
+  const dpr = window.devicePixelRatio || 1;
+  const W = cv.parentElement.clientWidth - 40;
+  const H = cv.height;
+  cv.width = W * dpr; cv.height = H * dpr;
+  cv.style.width = W+'px'; cv.style.height = H+'px';
+  ctx.scale(dpr, dpr);
+
+  const pad = {t:16, r:12, b:26, l:52};
+  const pw = W-pad.l-pad.r, ph = H-pad.t-pad.b;
+  const minX = Math.min(...xs), maxX = Math.max(...xs);
+  const minY = fill ? Math.min(0,...ys) : Math.min(...ys);
+  const maxY = fill ? Math.max(0,...ys) : Math.max(...ys);
+  const rY = maxY-minY||1, rX = maxX-minX||1;
+  const sx = v => pad.l+((v-minX)/rX)*pw;
+  const sy = v => pad.t+ph-((v-minY)/rY)*ph;
+
+  ctx.strokeStyle = 'rgba(28,39,64,.6)'; ctx.lineWidth = 1;
+  for(let i=0;i<=4;i++) { const y=pad.t+(ph/4)*i; ctx.beginPath(); ctx.moveTo(pad.l,y); ctx.lineTo(W-pad.r,y); ctx.stroke(); }
+
+  if (fill && minY < 0) {
+    ctx.strokeStyle='rgba(255,255,255,.08)'; ctx.lineWidth=1;
+    ctx.beginPath(); ctx.moveTo(pad.l,sy(0)); ctx.lineTo(W-pad.r,sy(0)); ctx.stroke();
+  }
+
+  if (fill) {
+    ctx.beginPath(); ctx.moveTo(sx(xs[0]),sy(0));
+    for(let i=0;i<xs.length;i++) ctx.lineTo(sx(xs[i]),sy(ys[i]));
+    ctx.lineTo(sx(xs[xs.length-1]),sy(0)); ctx.closePath();
+    const m = color.match(/\d+/g);
+    const rgb = m ? m.slice(0,3).join(',') : '59,130,246';
+    const grad = ctx.createLinearGradient(0,pad.t,0,pad.t+ph);
+    grad.addColorStop(0,'rgba('+rgb+',.18)');
+    grad.addColorStop(1,'rgba('+rgb+',.01)');
+    ctx.fillStyle = grad; ctx.fill();
+  }
+
+  ctx.beginPath();
+  for(let i=0;i<xs.length;i++) { const x=sx(xs[i]),y=sy(ys[i]); i===0?ctx.moveTo(x,y):ctx.lineTo(x,y); }
+  ctx.strokeStyle = color; ctx.lineWidth = 1.4; ctx.stroke();
+
+  ctx.fillStyle='#5a6680'; ctx.font='10px IBM Plex Mono'; ctx.textAlign='right';
+  for(let i=0;i<=4;i++) { const val=maxY-(rY/4)*i; ctx.fillText(val.toFixed(val>1000?0:1),pad.l-6,pad.t+(ph/4)*i+4); }
+  ctx.textAlign='center';
+  for(let i=0;i<=5;i++) { const val=minX+(rX/5)*i; ctx.fillText(val.toFixed(0),sx(val),H-6); }
+}
+
+function fmt(v) { return (v>=0?'+':'')+v.toFixed(2); }
+function card(label, value, cls) {
+  return '<div class="s-card"><div class="s-label">'+label+'</div><div class="s-val '+cls+'">'+value+'</div></div>';
+}
+</script>
+</body>
+</html>
