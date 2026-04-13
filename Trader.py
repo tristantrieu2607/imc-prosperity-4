@@ -1,8 +1,8 @@
 from datamodel import OrderDepth, UserId, TradingState, Order
 from typing import List, Dict
-import json 
+import json
 
-class Trader: 
+class Trader:
 
     LIMITS = {
         "EMERALDS": 80,
@@ -10,8 +10,9 @@ class Trader:
     }
 
     def run(self, state: TradingState): 
-        result = {}
+        result = {} # Mapping products to order lists
 
+        # Load saved data from previous tick 
         if state.traderData and state.traderData != "": 
             trader_data = json.loads(state.traderData)
         else: 
@@ -19,28 +20,55 @@ class Trader:
         
         for product in state.order_depths: 
             order_depth = state.order_depths[product]
-            orders: List[Order] = []
             position = state.position.get(product, 0)
 
             if product == "EMERALDS":
-                orders = self.trade_emeralds(order_depth, position)
+                # Updated to pass and receive trader_data for historical tracking
+                orders, trader_data = self.trade_emeralds(order_depth, position, trader_data)
             elif product == "TOMATOES":
                 orders, trader_data = self.trade_tomatoes(order_depth, position, trader_data)
             
             result[product] = orders
+            
         trader_data_string = json.dumps(trader_data)
-        conversions = 0
+        conversions = 0 # Currency conversion 
         return result, conversions, trader_data_string 
     
-    def trade_emeralds(self, order_depth: OrderDepth, position: int) -> List[Order]:
+    def trade_emeralds(self, order_depth: OrderDepth, position: int, trader_data: dict):
         orders: List[Order] = []
-        fair_value = 10000
         limit = self.LIMITS["EMERALDS"]
+
+        # === 1. Micro-Price Calculation ===
+        best_bid = max(order_depth.buy_orders.keys()) if len(order_depth.buy_orders) > 0 else 10000
+        best_ask = min(order_depth.sell_orders.keys()) if len(order_depth.sell_orders) > 0 else 10000
+
+        bid_vol = order_depth.buy_orders.get(best_bid, 0)
+        ask_vol = abs(order_depth.sell_orders.get(best_ask, 0))
+        total_vol = bid_vol + ask_vol
+
+        if total_vol > 0:
+            micro_price = (best_bid * ask_vol + best_ask * bid_vol) / total_vol
+        else:
+            micro_price = (best_bid + best_ask) / 2
+
+        # === 2. Central Limit Theorem (Rolling Mean) ===
+        if "emeralds_history" in trader_data:
+            history = trader_data["emeralds_history"]
+            history.append(micro_price)
+            if len(history) > 15: 
+                history.pop(0)
+            sample_mean = sum(history) / len(history)
+            trader_data["emeralds_history"] = history
+        else:
+            sample_mean = micro_price
+            trader_data["emeralds_history"] = [micro_price]
+
+        fair_value = round((10000 + sample_mean) / 2)
 
         buy_volume = 0 
         sell_volume = 0
 
-        # STEP 1: TAKE — buy below fair, sell above fair
+        # === STEP 1: AGGRESSIVE TAKE ===
         if len(order_depth.sell_orders) > 0: 
             for ask_price, ask_volume in sorted(order_depth.sell_orders.items()):
                 if ask_price < fair_value: 
@@ -48,10 +76,10 @@ class Trader:
                     qty = min(-ask_volume, can_buy)
                     if qty > 0: 
                         orders.append(Order("EMERALDS", ask_price, qty))
-                        buy_volume += qty
+                        buy_volume += qty 
 
         if len(order_depth.buy_orders) > 0: 
-            for bid_price, bid_volume in sorted(order_depth.buy_orders.items(), reverse=True):
+            for bid_price, bid_volume in sorted(order_depth.buy_orders.items(), reverse = True):
                 if bid_price > fair_value: 
                     can_sell = limit + (position - sell_volume)
                     qty = min(bid_volume, can_sell)
@@ -59,7 +87,7 @@ class Trader:
                         orders.append(Order("EMERALDS", bid_price, -qty))
                         sell_volume += qty
         
-        # STEP 2: CLEAR — flatten inventory at fair value
+        # === STEP 2: CLEAR ===
         position_after_take = position + buy_volume - sell_volume
 
         if position_after_take > 0: 
@@ -76,124 +104,93 @@ class Trader:
                 orders.append(Order("EMERALDS", fair_value, qty))
                 buy_volume += qty 
 
-        # STEP 3: MAKE — passive orders with inventory skew
-        spread = 4
-
-        # Skew: shift both quotes to encourage flattening
-        # Long position -> shift quotes down (easier to sell)
-        # Short position -> shift quotes up (easier to buy)
-        skew = round(position * 0.1)
+        # === STEP 3: HYBRID MAKE (Dynamic Layers) ===
         
-        buy_price = fair_value - spread - skew
-        sell_price = fair_value + spread - skew
+        # Inventory Skew (Tuned to 1 for stubbornness)
+        skew = int((position_after_take / limit) * 1) 
 
-        # Scale down size when inventory is high
-        inv_ratio = abs(position) / limit
-        size_mult = max(0.25, 1.0 - inv_ratio)
+        # Layer 1: Dynamic Spread (Reacts to live market to prevent overfitting)
+        market_spread = best_ask - best_bid
+        dynamic_inner_spread = max(1, (market_spread // 2) - 1)
 
+        # Layer 2: Outlier Spread (Fixed wide net)
+        outlier_spread = 7
+
+        # --- Buy Layers ---
         can_buy = limit - (position + buy_volume)
-        buy_qty = max(0, round(can_buy * size_mult))
-        if buy_qty > 0:
-            orders.append(Order("EMERALDS", buy_price, buy_qty))
+        if can_buy > 0:
+            # Put 50% capacity into the competitive dynamic layer
+            vol_layer1 = can_buy // 2
+            buy_price_inner = fair_value - dynamic_inner_spread - skew
+            if vol_layer1 > 0:
+                orders.append(Order("EMERALDS", buy_price_inner, vol_layer1))
+            
+            # Put remaining 50% capacity into the deep outlier net
+            vol_layer2 = can_buy - vol_layer1
+            buy_price_outer = fair_value - outlier_spread - skew
+            # Ensure the outlier order doesn't accidentally overlap the inner order
+            if buy_price_outer >= buy_price_inner:
+                buy_price_outer = buy_price_inner - 1
+            if vol_layer2 > 0:
+                orders.append(Order("EMERALDS", buy_price_outer, vol_layer2))
 
+        # --- Sell Layers ---
         can_sell = limit + (position - sell_volume)
-        sell_qty = max(0, round(can_sell * size_mult))
-        if sell_qty > 0:
-            orders.append(Order("EMERALDS", sell_price, -sell_qty))
+        if can_sell > 0:
+            # Put 50% capacity into the competitive dynamic layer
+            vol_layer1 = can_sell // 2
+            sell_price_inner = fair_value + dynamic_inner_spread - skew
+            if vol_layer1 > 0:
+                orders.append(Order("EMERALDS", sell_price_inner, -vol_layer1))
+            
+            # Put remaining 50% capacity into the deep outlier net
+            vol_layer2 = can_sell - vol_layer1
+            sell_price_outer = fair_value + outlier_spread - skew
+            # Ensure the outlier order doesn't accidentally overlap the inner order
+            if sell_price_outer <= sell_price_inner:
+                sell_price_outer = sell_price_inner + 1
+            if vol_layer2 > 0:
+                orders.append(Order("EMERALDS", sell_price_outer, -vol_layer2))
 
-        return orders
+        return orders, trader_data
     
     def trade_tomatoes(self, order_depth: OrderDepth, position: int, trader_data: dict):
         orders: List[Order] = []
         limit = self.LIMITS["TOMATOES"]
 
-        # Wall mid — use level 2 prices for more stability
-        bid_prices = sorted(order_depth.buy_orders.keys(), reverse=True)
-        ask_prices = sorted(order_depth.sell_orders.keys())
+        # 1. Use Micro-Price for better lead on fair value
+        best_bid = max(order_depth.buy_orders.keys())
+        best_ask = min(order_depth.sell_orders.keys())
+        bid_vol = order_depth.buy_orders.get(best_bid, 0)
+        ask_vol = abs(order_depth.sell_orders.get(best_ask, 0))
         
-        best_bid = bid_prices[0]
-        best_ask = ask_prices[0]
-        
-        if len(bid_prices) >= 2 and len(ask_prices) >= 2:
-            wall_mid = (bid_prices[1] + ask_prices[1]) / 2
-        else:
-            wall_mid = (best_bid + best_ask) / 2
+        micro_price = (best_bid * ask_vol + best_ask * bid_vol) / (bid_vol + ask_vol)
 
-        # EMA as dynamic fair value — span 12 gives a good balance
-        # Too fast (2) = fair value tracks market, no edge on takes
-        # Too slow (40) = fair value lags too much, bad fills
-        ema_span = 12
-        alpha = 2 / (ema_span + 1)
-
-        if "tomatoes_ema" in trader_data:
-            ema = trader_data["tomatoes_ema"]
-            ema = alpha * wall_mid + (1 - alpha) * ema
-        else:
-            ema = wall_mid
-
+        # 2. Faster EMA 
+        alpha = 0.5 # Higher alpha = more responsive to recent micro-price
+        ema = trader_data.get("tomatoes_ema", micro_price)
+        ema = alpha * micro_price + (1 - alpha) * ema
         trader_data["tomatoes_ema"] = ema
         fair_value = round(ema)
 
-        buy_volume = 0
-        sell_volume = 0
+        # 3. Dynamic Skewing based on inventory
+        # Move prices down if long, up if short
+        inventory_skew = int((position / limit) * 2) 
 
-        # STEP 1: TAKE
-        if len(order_depth.sell_orders) > 0:
-            for ask_price, ask_volume in sorted(order_depth.sell_orders.items()):
-                if ask_price < fair_value:
-                    can_buy = limit - (position + buy_volume)
-                    qty = min(-ask_volume, can_buy)
-                    if qty > 0:
-                        orders.append(Order("TOMATOES", ask_price, qty))
-                        buy_volume += qty
+        # 4. Market Making with better edge
+        # Instead of fixed spread of 4, try to be at the top of the book
+        buy_price = min(best_bid + 1, fair_value - 1) - inventory_skew
+        sell_price = max(best_ask - 1, fair_value + 1) - inventory_skew
 
-        if len(order_depth.buy_orders) > 0:
-            for bid_price, bid_volume in sorted(order_depth.buy_orders.items(), reverse=True):
-                if bid_price > fair_value:
-                    can_sell = limit + (position - sell_volume)
-                    qty = min(bid_volume, can_sell)
-                    if qty > 0:
-                        orders.append(Order("TOMATOES", bid_price, -qty))
-                        sell_volume += qty
+        # ... (Include your existing TAKE and CLEAR logic here) ...
 
-        # STEP 2: CLEAR
-        position_after_take = position + buy_volume - sell_volume
-
-        if position_after_take > 0:
-            can_sell = limit + (position - sell_volume)
-            qty = min(position_after_take, can_sell)
-            if qty > 0:
-                orders.append(Order("TOMATOES", fair_value, -qty))
-                sell_volume += qty
-
-        elif position_after_take < 0:
-            can_buy = limit - (position + buy_volume)
-            qty = min(-position_after_take, can_buy)
-            if qty > 0:
-                orders.append(Order("TOMATOES", fair_value, qty))
-                buy_volume += qty
-
-        # STEP 3: MAKE — wider spread + inventory skew
-        spread = 6  # Wider than Emeralds because Tomatoes drifts
-
-        # Inventory skew — stronger than Emeralds because drift = more risk
-        skew = round(position * 0.15)
-        
-        buy_price = fair_value - spread - skew
-        sell_price = fair_value + spread - skew
-
-        # Scale down size when loaded
-        inv_ratio = abs(position) / limit
-        size_mult = max(0.25, 1.0 - inv_ratio)
-
+        # 5. Updated MAKE logic
         can_buy = limit - (position + buy_volume)
-        buy_qty = max(0, round(can_buy * size_mult))
-        if buy_qty > 0:
-            orders.append(Order("TOMATOES", buy_price, buy_qty))
+        if can_buy > 0:
+            orders.append(Order("TOMATOES", int(buy_price), can_buy))
 
         can_sell = limit + (position - sell_volume)
-        sell_qty = max(0, round(can_sell * size_mult))
-        if sell_qty > 0:
-            orders.append(Order("TOMATOES", sell_price, -sell_qty))
+        if can_sell > 0:
+            orders.append(Order("TOMATOES", int(sell_price), -can_sell))
 
         return orders, trader_data
