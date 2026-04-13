@@ -25,7 +25,6 @@ class Trader:
             position = state.position.get(product,0)
 
             if product == "EMERALDS":
-                if product == "EMERALDS":
                 # Pass trader_data in, and capture it coming out
                 orders, trader_data = self.trade_emeralds(order_depth, position, trader_data)
             elif product == "TOMATOES":
