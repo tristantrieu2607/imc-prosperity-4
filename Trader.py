@@ -25,7 +25,9 @@ class Trader:
             position = state.position.get(product,0)
 
             if product == "EMERALDS":
-                orders = self.trade_emeralds(order_depth, position)
+                if product == "EMERALDS":
+                # Pass trader_data in, and capture it coming out
+                orders, trader_data = self.trade_emeralds(order_depth, position, trader_data)
             elif product == "TOMATOES":
                 orders, trader_data = self.trade_tomatoes(order_depth, position, trader_data)
             
@@ -34,82 +36,98 @@ class Trader:
         conversions = 0 # Currency conversion 
         return result, conversions, trader_data_string 
     
-    def trade_emeralds(self, order_depth: OrderDepth, position: int) -> List[Order]:
+    def trade_emeralds(self, order_depth: OrderDepth, position: int, trader_data: dict) -> tuple[List[Order], dict]:
         orders: List[Order] = []
-        fair_value = 10000
         limit = self.LIMITS["EMERALDS"]
 
-        # Track how much we've bought and sold this tick 
-        buy_volume = 0 
+        # 1. Calculate current mid price
+        best_bid = max(order_depth.buy_orders.keys()) if order_depth.buy_orders else 10000
+        best_ask = min(order_depth.sell_orders.keys()) if order_depth.sell_orders else 10000
+        mid_price = (best_bid + best_ask) / 2
+
+        # 2. Update price history in trader_data
+        window_size = 20 
+        history = trader_data.get("emeralds_history", [])
+        history.append(mid_price)
+        if len(history) > window_size:
+            history.pop(0) 
+        trader_data["emeralds_history"] = history
+
+        # 3. Calculate Rolling Mean and STD
+        if len(history) < 2:
+            fair_value = mid_price
+            std = 2 
+        else:
+            fair_value = sum(history) / len(history)
+            variance = sum((x - fair_value) ** 2 for x in history) / len(history)
+            std = variance ** 0.5
+            if std == 0: 
+                std = 1 
+
+        # 4. Outlier Bands
+        z_score = 2.0 
+        upper_band = fair_value + (z_score * std)
+        lower_band = fair_value - (z_score * std)
+
+        buy_volume = 0
         sell_volume = 0
 
-        # STEP 1: TAKE
-        
-        # Buy from anyone selling below fair value 
-        if len(order_depth.sell_orders) > 0: 
+        # STEP 1: TAKE OUTLIERS
+        if len(order_depth.sell_orders) > 0:
             for ask_price, ask_volume in sorted(order_depth.sell_orders.items()):
-                if ask_price < fair_value: 
+                if ask_price <= lower_band: 
                     can_buy = limit - (position + buy_volume)
                     qty = min(-ask_volume, can_buy)
-                    if qty > 0: 
+                    if qty > 0:
                         orders.append(Order("EMERALDS", ask_price, qty))
                         buy_volume += qty
 
-        # Sell to anyone buying above fair value 
-        if len(order_depth.buy_orders) > 0: 
-            for bid_price, bid_volume in sorted(order_depth.buy_orders.items(), reverse = True):
-                if bid_price > fair_value: 
+        if len(order_depth.buy_orders) > 0:
+            for bid_price, bid_volume in sorted(order_depth.buy_orders.items(), reverse=True):
+                if bid_price >= upper_band: 
                     can_sell = limit + (position - sell_volume)
                     qty = min(bid_volume, can_sell)
-                    if qty > 0: 
+                    if qty > 0:
                         orders.append(Order("EMERALDS", bid_price, -qty))
                         sell_volume += qty
-        
-        # STEP 2: CLEAR 
-        position_after_take = position + buy_volume - sell_volume
 
-        # Long - sell at fair value to reduce
-        if position_after_take > 0: 
+        # STEP 2: CLEAR AT THE MEAN
+        position_after_take = position + buy_volume - sell_volume
+        clear_price = round(fair_value)
+
+        if position_after_take > 0:
             can_sell = limit + (position - sell_volume)
             qty = min(position_after_take, can_sell)
-            if qty > 0: 
-               orders.append(Order("EMERALDS", fair_value, -qty))
-               sell_volume += qty
-        
-        # Short - buy at fair value to reduce
-        elif position_after_take < 0: 
+            if qty > 0:
+                orders.append(Order("EMERALDS", clear_price, -qty))
+                sell_volume += qty
+        elif position_after_take < 0:
             can_buy = limit - (position + buy_volume)
             qty = min(-position_after_take, can_buy)
-            if qty > 0: 
-                orders.append(Order("EMERALDS", fair_value, qty))
-                buy_volume += qty 
+            if qty > 0:
+                orders.append(Order("EMERALDS", clear_price, qty))
+                buy_volume += qty
 
-        # STEP 3: MAKE (with inventory skewing)
-        spread = 4
-        
-        # Skew quotes based on inventory - shift both prices to encourage flattening
+        # STEP 3: MAKE AT THE BANDS
+        spread = 1 
         skew = round(position * 0.1)
-        
-        buy_price = fair_value - spread - skew
-        sell_price = fair_value + spread - skew
+        buy_price = round(lower_band) - spread - skew
+        sell_price = round(upper_band) + spread - skew
 
-        # Reduce size when inventory is high
         inv_ratio = abs(position) / limit
         size_mult = max(0.2, 1.0 - inv_ratio)
 
-        # Passive buy order
         can_buy = limit - (position + buy_volume)
-        buy_qty = round(can_buy * size_mult) # buy + sell quantity 
+        buy_qty = round(can_buy * size_mult)
         if buy_qty > 0:
             orders.append(Order("EMERALDS", buy_price, buy_qty))
 
-        # Passive sell order
         can_sell = limit + (position - sell_volume)
         sell_qty = round(can_sell * size_mult)
         if sell_qty > 0:
             orders.append(Order("EMERALDS", sell_price, -sell_qty))
 
-        return orders
+        return orders, trader_data
     
     def trade_tomatoes(self, order_depth: OrderDepth, position: int, trader_data: dict):
         orders: List[Order] = []
