@@ -158,39 +158,76 @@ class Trader:
         orders: List[Order] = []
         limit = self.LIMITS["TOMATOES"]
 
-        # 1. Use Micro-Price for better lead on fair value
-        best_bid = max(order_depth.buy_orders.keys())
-        best_ask = min(order_depth.sell_orders.keys())
-        bid_vol = order_depth.buy_orders.get(best_bid, 0)
-        ask_vol = abs(order_depth.sell_orders.get(best_ask, 0))
+        # 1. Micro-Price Calculation
+        best_bid = max(order_depth.buy_orders.keys()) if order_depth.buy_orders else 0
+        best_ask = min(order_depth.sell_orders.keys()) if order_depth.sell_orders else 0
         
-        micro_price = (best_bid * ask_vol + best_ask * bid_vol) / (bid_vol + ask_vol)
+        if best_bid and best_ask:
+            bid_vol = order_depth.buy_orders.get(best_bid, 0)
+            ask_vol = abs(order_depth.sell_orders.get(best_ask, 0))
+            micro_price = (best_bid * ask_vol + best_ask * bid_vol) / (bid_vol + ask_vol)
+        else:
+            micro_price = (best_bid + best_ask) / 2 if (best_bid or best_ask) else 5000 # Fallback
 
-        # 2. Faster EMA 
-        alpha = 0.5 # Higher alpha = more responsive to recent micro-price
+        # 2. Faster EMA for Fair Value
+        alpha = 0.5 
         ema = trader_data.get("tomatoes_ema", micro_price)
         ema = alpha * micro_price + (1 - alpha) * ema
         trader_data["tomatoes_ema"] = ema
         fair_value = round(ema)
 
-        # 3. Dynamic Skewing based on inventory
-        # Move prices down if long, up if short
+        # Initialize trackers to prevent NameError
+        buy_volume = 0
+        sell_volume = 0
+
+        # === STEP 1: TAKE (Aggressive) ===
+        # Buy from sellers if price is below our fair value
+        for ask_price, ask_qty in sorted(order_depth.sell_orders.items()):
+            if ask_price < fair_value:
+                can_buy = limit - (position + buy_volume)
+                qty = min(-ask_qty, can_buy)
+                if qty > 0:
+                    orders.append(Order("TOMATOES", ask_price, qty))
+                    buy_volume += qty
+
+        # Sell to buyers if price is above our fair value
+        for bid_price, bid_qty in sorted(order_depth.buy_orders.items(), reverse=True):
+            if bid_price > fair_value:
+                can_sell = limit + (position - sell_volume)
+                qty = min(bid_qty, can_sell)
+                if qty > 0:
+                    orders.append(Order("TOMATOES", bid_price, -qty))
+                    sell_volume += qty
+
+        # === STEP 2: CLEAR (Reduce Position at Fair Value) ===
+        pos_after_take = position + buy_volume - sell_volume
+        if pos_after_take > 0: # Long: try to sell
+            can_sell = limit + (position - sell_volume)
+            qty = min(pos_after_take, can_sell)
+            if qty > 0:
+                orders.append(Order("TOMATOES", fair_value, -qty))
+                sell_volume += qty
+        elif pos_after_take < 0: # Short: try to buy
+            can_buy = limit - (position + buy_volume)
+            qty = min(-pos_after_take, can_buy)
+            if qty > 0:
+                orders.append(Order("TOMATOES", fair_value, qty))
+                buy_volume += qty
+
+        # === STEP 3: MAKE (Passive Liquidity) ===
         inventory_skew = int((position / limit) * 2) 
+        
+        # Competitive pricing: try to sit at the top of the book
+        buy_price = int(min(best_bid + 1, fair_value - 1) - inventory_skew)
+        sell_price = int(max(best_ask - 1, fair_value + 1) - inventory_skew)
 
-        # 4. Market Making with better edge
-        # Instead of fixed spread of 4, try to be at the top of the book
-        buy_price = min(best_bid + 1, fair_value - 1) - inventory_skew
-        sell_price = max(best_ask - 1, fair_value + 1) - inventory_skew
+        # Place remaining capacity
+        can_buy_remaining = limit - (position + buy_volume)
+        if can_buy_remaining > 0:
+            orders.append(Order("TOMATOES", buy_price, can_buy_remaining))
 
-        # ... (Include your existing TAKE and CLEAR logic here) ...
-
-        # 5. Updated MAKE logic
-        can_buy = limit - (position + buy_volume)
-        if can_buy > 0:
-            orders.append(Order("TOMATOES", int(buy_price), can_buy))
-
-        can_sell = limit + (position - sell_volume)
-        if can_sell > 0:
-            orders.append(Order("TOMATOES", int(sell_price), -can_sell))
+        can_sell_remaining = limit + (position - sell_volume)
+        if can_sell_remaining > 0:
+            orders.append(Order("TOMATOES", sell_price, -can_sell_remaining))
 
         return orders, trader_data
