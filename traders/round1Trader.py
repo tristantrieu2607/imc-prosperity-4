@@ -31,78 +31,79 @@ class Trader:
         trader_data_string = json.dumps(trader_data)
         return result, 0, trader_data_string 
     
-    def trade_osmium(self, order_depth: OrderDepth, position: int, trader_data: dict):
+    def trade_osmium(self, product: str, order_depth: OrderDepth, position: int, trader_data: dict):
         orders: List[Order] = []
-        limit = self.LIMITS.get("OSMIUM", 80)
-
-        # 1. Hardcoded Fair Value (Based on EDA: Perfectly Stationary)
+        limit = self.LIMITS.get(product, 80)
         fair_value = 10000
+
+        if not order_depth.buy_orders or not order_depth.sell_orders:
+            return orders, trader_data
 
         buy_volume = 0
         sell_volume = 0
 
-        # === STEP 1: TAKE FAVORABLE ===
-        if len(order_depth.sell_orders) > 0:
-            for ask_price, ask_volume in sorted(order_depth.sell_orders.items()):
-                if ask_price < fair_value:
-                    can_buy = limit - (position + buy_volume)
-                    qty = min(abs(ask_volume), can_buy)
-                    if qty > 0:
-                        orders.append(Order("OSMIUM", int(ask_price), int(qty)))
-                        buy_volume += qty
+        # === STEP 1: IMMEDIATELY TAKE FAVORABLE ===
+        for ask_price, ask_volume in sorted(order_depth.sell_orders.items()):
+            if ask_price < fair_value:
+                can_buy = limit - (position + buy_volume)
+                qty = min(abs(ask_volume), can_buy)
+                if qty > 0:
+                    orders.append(Order(product, int(ask_price), int(qty)))
+                    buy_volume += qty
 
-        if len(order_depth.buy_orders) > 0:
-            for bid_price, bid_volume in sorted(order_depth.buy_orders.items(), reverse=True):
-                if bid_price > fair_value:
-                    can_sell = limit + (position - sell_volume)
-                    qty = min(bid_volume, can_sell)
-                    if qty > 0:
-                        orders.append(Order("OSMIUM", int(bid_price), -int(qty)))
-                        sell_volume += qty
+        for bid_price, bid_volume in sorted(order_depth.buy_orders.items(), reverse=True):
+            if bid_price > fair_value:
+                can_sell = limit + (position - sell_volume)
+                qty = min(bid_volume, can_sell)
+                if qty > 0:
+                    orders.append(Order(product, int(bid_price), -int(qty)))
+                    sell_volume += qty
 
         position_after_take = position + buy_volume - sell_volume
 
-        # === STEP 2: SCRATCH CHOKE-RELEASE ===
-        scratch_threshold = 40
-        if position_after_take > scratch_threshold:
-            excess = position_after_take - scratch_threshold
+        # === STEP 2: FLATTEN INVENTORY SKEW ===
+        skew_threshold = 40
+        if position_after_take > skew_threshold:
+            excess = position_after_take - skew_threshold
             can_sell = limit + (position - sell_volume)
             qty = min(excess, can_sell)
             if qty > 0:
-                orders.append(Order("OSMIUM", int(fair_value), -int(qty)))
+                orders.append(Order(product, int(fair_value), -int(qty)))
                 sell_volume += qty
-        elif position_after_take < -scratch_threshold:
-            excess = abs(position_after_take) - scratch_threshold
+                
+        elif position_after_take < -skew_threshold:
+            excess = abs(position_after_take) - skew_threshold
             can_buy = limit - (position + buy_volume)
             qty = min(excess, can_buy)
             if qty > 0:
-                orders.append(Order("OSMIUM", int(fair_value), int(qty)))
+                orders.append(Order(product, int(fair_value), int(qty)))
                 buy_volume += qty
 
-        # === STEP 3: THE DEEP OSMIUM STATIC LADDER ===
-        buy_levels = [fair_value - 6, fair_value - 10, fair_value - 15]   
-        sell_levels = [fair_value + 6, fair_value + 10, fair_value + 15]  
-        vol_weights = [0.50, 0.30, 0.20] 
+        # === STEP 3: PASSIVE QUOTES (PENNYING) ===
+        my_buy_price = fair_value - 1
+        my_sell_price = fair_value + 1
 
-        # --- Place Buy Ladder ---
+        for bp, bv in sorted(order_depth.buy_orders.items(), reverse=True):
+            if bv > 1 and bp < fair_value - 1: 
+                my_buy_price = bp + 1
+                break
+                
+        for sp, sv in sorted(order_depth.sell_orders.items()):
+            if abs(sv) > 1 and sp > fair_value + 1:
+                my_sell_price = sp - 1
+                break
+
+        if my_buy_price >= my_sell_price:
+            my_buy_price = fair_value - 1
+            my_sell_price = fair_value + 1
+
         can_buy = limit - (position + buy_volume)
-        base_can_buy = can_buy 
         if can_buy > 0:
-            for i in range(len(buy_levels)):
-                vol = can_buy if i == len(buy_levels) - 1 else int(base_can_buy * vol_weights[i])
-                if vol > 0:
-                    orders.append(Order("OSMIUM", int(buy_levels[i]), int(vol)))
-                    can_buy -= vol
+            orders.append(Order(product, int(my_buy_price), int(can_buy)))
 
-        # --- Place Sell Ladder ---
         can_sell = limit + (position - sell_volume)
-        base_can_sell = can_sell
         if can_sell > 0:
-            for i in range(len(sell_levels)):
-                vol = can_sell if i == len(sell_levels) - 1 else int(base_can_sell * vol_weights[i])
-                if vol > 0:
-                    orders.append(Order("OSMIUM", int(sell_levels[i]), -int(vol)))
-                    can_sell -= vol
+            orders.append(Order(product, int(my_sell_price), -int(can_sell)))
 
         return orders, trader_data
 
