@@ -1,36 +1,45 @@
 from datamodel import OrderDepth, UserId, TradingState, Order
 from typing import List, Dict
+import traceback
 import json
 
 class Trader:
 
     LIMITS = {
-        "OSMIUM": 80,
-        "PEPPER": 80
+        "ASH_COATED_OSMIUM": 80,
+        "INTARIAN_PEPPER_ROOT": 80
     }
 
     def run(self, state: TradingState): 
         result = {}
-
-        if state.traderData and state.traderData != "": 
-            trader_data = json.loads(state.traderData)
-        else: 
-            trader_data = {}
         
-        for product in state.order_depths: 
-            order_depth = state.order_depths[product]
-            position = state.position.get(product, 0)
+        # 1. Safely load trader data
+        trader_data_string = state.traderData if state.traderData else ""
+        try:
+            trader_data = json.loads(trader_data_string) if trader_data_string else {}
+        except json.JSONDecodeError:
+            trader_data = {}
 
-            if product == "OSMIUM":
-                orders, trader_data = self.trade_osmium(order_depth, position, trader_data)
-            elif product == "PEPPER":
-                orders, trader_data = self.trade_pepper(order_depth, position, trader_data)
+        # 2. Main Logic Loop
+        try:
+            for product in state.order_depths: 
+                order_depth = state.order_depths[product]
+                position = state.position.get(product, 0)
+
+                if product == "ASH_COATED_OSMIUM":
+                    # FIXED: Pass 4 arguments to match call
+                    orders, trader_data = self.trade_osmium(product, order_depth, position, trader_data)
+                    result[product] = orders
+                elif product == "INTARIAN_PEPPER_ROOT":
+                    orders, trader_data = self.trade_pepper(product, order_depth, position, trader_data)
+                    result[product] = orders
+
+        except Exception as e:
+            print(f"Error encountered: {traceback.format_exc()}")
             
-            result[product] = orders
-            
-        trader_data_string = json.dumps(trader_data)
-        return result, 0, trader_data_string 
+        return result, 0, json.dumps(trader_data)
     
+    # FIXED: Added 'product' to the signature
     def trade_osmium(self, product: str, order_depth: OrderDepth, position: int, trader_data: dict):
         orders: List[Order] = []
         limit = self.LIMITS.get(product, 80)
@@ -41,6 +50,8 @@ class Trader:
 
         buy_volume = 0
         sell_volume = 0
+        skew_threshold = 80
+        margin = 1
 
         # === STEP 1: IMMEDIATELY TAKE FAVORABLE ===
         for ask_price, ask_volume in sorted(order_depth.sell_orders.items()):
@@ -48,7 +59,7 @@ class Trader:
                 can_buy = limit - (position + buy_volume)
                 qty = min(abs(ask_volume), can_buy)
                 if qty > 0:
-                    orders.append(Order(product, int(ask_price), int(qty)))
+                    orders.append(Order("ASH_COATED_OSMIUM", int(ask_price), int(qty)))
                     buy_volume += qty
 
         for bid_price, bid_volume in sorted(order_depth.buy_orders.items(), reverse=True):
@@ -56,19 +67,18 @@ class Trader:
                 can_sell = limit + (position - sell_volume)
                 qty = min(bid_volume, can_sell)
                 if qty > 0:
-                    orders.append(Order(product, int(bid_price), -int(qty)))
+                    orders.append(Order("ASH_COATED_OSMIUM", int(bid_price), -int(qty)))
                     sell_volume += qty
 
         position_after_take = position + buy_volume - sell_volume
 
         # === STEP 2: FLATTEN INVENTORY SKEW ===
-        skew_threshold = 40
         if position_after_take > skew_threshold:
             excess = position_after_take - skew_threshold
             can_sell = limit + (position - sell_volume)
             qty = min(excess, can_sell)
             if qty > 0:
-                orders.append(Order(product, int(fair_value), -int(qty)))
+                orders.append(Order("ASH_COATED_OSMIUM", int(fair_value), -int(qty)))
                 sell_volume += qty
                 
         elif position_after_take < -skew_threshold:
@@ -76,26 +86,30 @@ class Trader:
             can_buy = limit - (position + buy_volume)
             qty = min(excess, can_buy)
             if qty > 0:
-                orders.append(Order(product, int(fair_value), int(qty)))
+                orders.append(Order("ASH_COATED_OSMIUM", int(fair_value), int(qty)))
                 buy_volume += qty
 
-        # === STEP 3: PASSIVE QUOTES (PENNYING) ===
-        my_buy_price = fair_value - 1
-        my_sell_price = fair_value + 1
+        # === STEP 3: PASSIVE QUOTES (FRANKFURT PENNYING) ===
+
+        my_buy_price = fair_value - margin
+        my_sell_price = fair_value + margin
 
         for bp, bv in sorted(order_depth.buy_orders.items(), reverse=True):
-            if bv > 1 and bp < fair_value - 1: 
-                my_buy_price = bp + 1
+            # Only apply margin to the price checks, leave bv > 1 alone
+            if bv > 1 and bp < fair_value - margin: 
+                my_buy_price = bp + margin
                 break
                 
         for sp, sv in sorted(order_depth.sell_orders.items()):
-            if abs(sv) > 1 and sp > fair_value + 1:
-                my_sell_price = sp - 1
+            # Only apply margin to the price checks, leave abs(sv) > 1 alone
+            if abs(sv) > 1 and sp > fair_value + margin:
+                my_sell_price = sp - margin
                 break
 
+        # Safety Fallback
         if my_buy_price >= my_sell_price:
-            my_buy_price = fair_value - 1
-            my_sell_price = fair_value + 1
+            my_buy_price = fair_value - margin
+            my_sell_price = fair_value + margin
 
         can_buy = limit - (position + buy_volume)
         if can_buy > 0:
@@ -107,66 +121,44 @@ class Trader:
 
         return orders, trader_data
 
-    def trade_pepper(self, order_depth: OrderDepth, position: int, trader_data: dict):
+    def trade_pepper(self, product: str, order_depth: OrderDepth, position: int, trader_data: dict):
         orders: List[Order] = []
-        limit = self.LIMITS.get("PEPPER", 80)
+        limit = self.LIMITS.get(product, 80)
+        
+        if not order_depth.buy_orders or not order_depth.sell_orders:
+            return orders, trader_data
 
-        # --- Fair Value Calculation (EMA for Drifting) ---
-        best_bid = max(order_depth.buy_orders.keys()) if order_depth.buy_orders else 10000
-        best_ask = min(order_depth.sell_orders.keys()) if order_depth.sell_orders else 10000
+        best_bid = max(order_depth.buy_orders.keys())
+        best_ask = min(order_depth.sell_orders.keys())
         mid_price = (best_bid + best_ask) / 2
         
-        alpha = 0.2 # Standard trend alpha
-        ema = trader_data.get("pepper_ema", mid_price)
+        # 1. Trend Tracking (EMA)
+        alpha = 0.01
+        ema_key = f"{product}_ema_slow"
+        ema = trader_data.get(ema_key, mid_price)
         ema = alpha * mid_price + (1 - alpha) * ema
-        trader_data["pepper_ema"] = ema
-        fair_value = int(round(ema))
+        trader_data[ema_key] = ema
 
-        buy_volume = 0
-        sell_volume = 0
+        # 2. Adjusted Safety (1% Guardrail)
+        stop_loss_threshold = ema * 0.99 
 
-        # === STEP 1: TAKE (Aggressive) ===
-        if len(order_depth.sell_orders) > 0:
-            for ask_price, ask_qty in sorted(order_depth.sell_orders.items()):
-                if ask_price < fair_value:
-                    qty = min(abs(ask_qty), limit - (position + buy_volume))
-                    if qty > 0:
-                        orders.append(Order("PEPPER", int(ask_price), int(qty)))
-                        buy_volume += qty
-
-        if len(order_depth.buy_orders) > 0:
+        if position > 0 and mid_price < stop_loss_threshold:
             for bid_price, bid_qty in sorted(order_depth.buy_orders.items(), reverse=True):
-                if bid_price > fair_value:
-                    qty = min(bid_qty, limit + (position - sell_volume))
-                    if qty > 0:
-                        orders.append(Order("PEPPER", int(bid_price), -int(qty)))
-                        sell_volume += qty
+                qty = min(bid_qty, position)
+                if qty > 0:
+                    orders.append(Order(product, int(bid_price), -int(qty)))
+                    position -= qty
+                    if position <= 0: break
+            return orders, trader_data
 
-        # === STEP 2: CLEAR ===
-        pos_after_take = position + buy_volume - sell_volume
-        if pos_after_take > 0: 
-            qty = min(abs(pos_after_take), limit + (position - sell_volume))
-            orders.append(Order("PEPPER", fair_value, -int(qty)))
-            sell_volume += qty
-        elif pos_after_take < 0:
-            qty = min(abs(pos_after_take), limit - (position + buy_volume))
-            orders.append(Order("PEPPER", fair_value, int(qty)))
-            buy_volume += qty
-
-        # === STEP 3: MAKE (Passive with Inventory Skew) ===
-        # Recalculate position for accurate skew
-        current_pos = position + buy_volume - sell_volume
-        inventory_skew = int((current_pos / limit) * 3) 
-        
-        buy_price = int(min(best_bid + 1, fair_value - 1) - inventory_skew)
-        sell_price = int(max(best_ask - 1, fair_value + 1) - inventory_skew)
-
-        can_buy_rem = limit - (position + buy_volume)
-        if can_buy_rem > 0:
-            orders.append(Order("PEPPER", buy_price, int(can_buy_rem)))
-
-        can_sell_rem = limit + (position - sell_volume)
-        if can_sell_rem > 0:
-            orders.append(Order("PEPPER", sell_price, -int(can_sell_rem)))
+        # 3. Aggressive Accumulation
+        if position < limit:
+            can_buy = limit - position
+            for ask_price, ask_qty in sorted(order_depth.sell_orders.items()):
+                if can_buy <= 0: break
+                buy_qty = min(abs(ask_qty), can_buy)
+                orders.append(Order(product, int(ask_price), int(buy_qty)))
+                can_buy -= buy_qty
+                position += buy_qty
 
         return orders, trader_data
