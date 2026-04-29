@@ -1,27 +1,31 @@
 """
-Round 4 — z_take v5: v4 + HYDROGEL extension scale-out.
+Round 4 — z_take v4 + HP-only passive market maker.
 
-The drawdown analysis (cell-by-cell over round-4 day-1 data):
+For HYDROGEL_PACK only, replaces the z-take with a tiny-position MM that
+quotes both sides near fair and bounds drawdown by design.
 
-  Position pinned at -200 short for 1380 ticks.
-  During those 1380 ticks, mid drifted from 9967 to 10081 (+114).
-  z stayed in (+0.5, +1.5) range the whole time (still says "sell more").
-  Existing logic: at limit -> can't sell, won't buy (z>0) -> watch the bleed.
-  MTM cost: -114 * 200 = -22,800. Exactly the observed drawdown.
+Why the swap (HP only):
+  - HP has the largest sigma * limit product in the book (32.6 * 200).
+    That's the worst possible inventory failure mode.
+  - Mark 14 makes +32k linear on HP doing exactly this — passive MM.
+  - z-take builds inventory on the way out then pins at the limit during
+    drift episodes. We've patched this 3 ways (scale-out, EMA, throttle)
+    and none worked. Fix the architecture instead.
 
-The fix is HYDROGEL-only and ONLY activates when we're at extension AND
-price is still moving against us (adverse drift). It triggers a partial
-scale-out at much weaker z than the normal flatten point (z=0).
+Design:
+  Soft position cap: ±40 (20% of hard limit)
+  Hard position cap: ±80 (we never quote past this)
+  Quote at floor(mid)-1 / ceil(mid)+1 by default
+  Skew quotes when inventory builds: tighten the side that flattens
+  Skip the side that would cross the soft cap
+  Imbalance veto kept (same threshold as v4): skip the side that would
+    take adversely-flowing liquidity
 
-  pos extension >= 80%, adverse drift -> scale out 5  at z=+0.6 (or -0.6)
-  pos extension >= 90%, adverse drift -> scale out 10 at z=+0.4
-  pos extension >= 95%, adverse drift -> scale out 20 at z=+0.2
+PnL ceiling: lower than v4 by design. Drawdown ceiling: bounded.
+Worst case: pinned at +80 long, mid drifts down 30 -> -2400 MTM.
+That's the upper bound. v4 worst case was -22.8k.
 
-Adverse drift = mid trend over last ~150 ticks moves further against position.
-We persist a tiny ring buffer of recent mids in traderData, HP only.
-
-Other products are NOT modified. Their structure is different (smaller
-absolute sigma * limit product), they never get pinned in this regime.
+Everything non-HP unchanged from v4.
 """
 
 import json
@@ -98,11 +102,10 @@ class Logger:
 logger = Logger()
 
 # ============================================================================
-# Per-product config (UNCHANGED from v4)
+# Per-product config — HYDROGEL_PACK row removed (handled separately below)
 # ============================================================================
 
 CFGS = [
-    {"symbol": "HYDROGEL_PACK",       "mean": 9994, "sd": 32.588, "z_thresh": 1.0, "take_size": 17, "limit": 200, "inv_penalty": False},
     {"symbol": "VELVETFRUIT_EXTRACT", "mean": 5247, "sd": 17.091, "z_thresh": 1.0, "take_size": 17, "limit": 200, "inv_penalty": False},
     {"symbol": "VEV_4000",            "mean": 1247, "sd": 17.114, "z_thresh": 1.0, "take_size": 17, "limit": 300, "inv_penalty": False},
     {"symbol": "VEV_4500",            "mean":  747, "sd": 17.105, "z_thresh": 1.0, "take_size": 17, "limit": 300, "inv_penalty": False},
@@ -122,29 +125,20 @@ DUMB_MARKS  = ("Mark 38", "Mark 55", "Mark 22")
 RECENT_TRADE_LOOKBACK = 5
 
 # ============================================================================
-# HP extension scale-out tuning
+# HP MM tuning — single place to adjust everything
 # ============================================================================
-# Extension thresholds, exit-z thresholds, and exit sizes are tiered.
-# Numbers chosen to:
-#   - Never fire below 80% extension (preserves normal MR edge)
-#   - Get progressively more aggressive as we approach the wall
-#   - Use modest sizes so we don't overshoot into a now-flat position
-HP_EXIT_TIERS = [
-    # (extension_min, z_threshold, exit_size)
-    (0.80, 0.60,  5),
-    (0.90, 0.40, 10),
-    (0.95, 0.20, 20),
-]
-# Adverse-drift window in TIMESTAMP units (each call advances ts by 100 in IMC).
-# 150 ticks = 15000 ts. We require the EMA-short to differ from EMA-long
-# by at least HP_DRIFT_MIN_PTS in the adverse direction.
-HP_DRIFT_LOOKBACK_TS = 15000
-HP_DRIFT_MIN_PTS     = 2.0     # min adverse drift (in price units) to trigger
-HP_MID_HISTORY_MAX   = 200     # cap on mid history we persist (~20k ts of memory)
+
+HP_MEAN          = 9994        # for sanity-bounding fair
+HP_SOFT_LIMIT    = 40          # don't quote past this on the building side
+HP_HARD_LIMIT    = 80          # absolute max position we'll ever hold
+HP_BASE_SIZE     = 15          # default quote size each side
+HP_BASE_OFFSET   = 1           # ticks from floor(mid)/ceil(mid)
+HP_SKEW_OFFSET   = 2           # extra ticks on the building side when inventoried
+HP_SKEW_TRIGGER  = 20          # |pos| above which we start skewing
 
 
 # ============================================================================
-# Top-of-book imbalance (UNCHANGED)
+# Top-of-book imbalance (UNCHANGED from v4)
 # ============================================================================
 
 def _l1_imbalance(depth):
@@ -161,7 +155,7 @@ def _l1_imbalance(depth):
 
 
 # ============================================================================
-# Counterparty modulator (UNCHANGED)
+# Counterparty modulator (UNCHANGED from v4)
 # ============================================================================
 
 def _counterparty_mult(state, sym, our_side):
@@ -181,7 +175,7 @@ def _counterparty_mult(state, sym, our_side):
 
 
 # ============================================================================
-# Book walker (UNCHANGED)
+# Book walker (UNCHANGED from v4)
 # ============================================================================
 
 def _walk_book(depth, side, sym, ok, qty_target):
@@ -204,117 +198,109 @@ def _walk_book(depth, side, sym, ok, qty_target):
 
 
 # ============================================================================
-# HP-only: extension scale-out
+# HYDROGEL_PACK: small-position passive market maker
 # ============================================================================
 
-def _hp_check_scale_out(state, depth, mid, pos, limit, store):
+def _hp_mm_orders(state):
     """
-    Returns a list of orders if a scale-out should fire, else None.
-    None means: defer to normal _z_take_orders logic.
+    Quote both sides near fair, with inventory-aware skew and hard caps.
 
-    Conditions for scale-out (ALL must hold):
-      1. |pos| / limit >= 0.80 (extension)
-      2. We have at least HP_DRIFT_LOOKBACK_TS of mid history
-      3. Drift in the last window is moving AGAINST our position
-         (mid rising while we're short, or falling while we're long)
-         by at least HP_DRIFT_MIN_PTS.
-      4. The current z (signed by position direction) is past the tier's
-         exit threshold but NOT yet at z=0 flatten (where normal logic
-         would already be exiting).
+    Decisions per tick:
+      1. fair = mid (book-derived, no state needed)
+      2. bid_offset / ask_offset depend on inventory:
+         - flat: symmetric (1/1)
+         - long (pos > +SKEW_TRIGGER): widen bid (3), tighten ask (1)
+           -> we sell more easily, buy less easily
+         - short (pos < -SKEW_TRIGGER): tighten bid (1), widen ask (3)
+      3. Skip the side that would push past soft limit
+      4. Size capped by hard limit room
+      5. L1 imbalance veto: don't post on the side that the book is fading
 
-    If all met, emit a closing order of the tier-appropriate size.
+    This is stateless. No traderData needed.
     """
-    if pos == 0:
-        return None
-    extension = abs(pos) / limit
-    if extension < HP_EXIT_TIERS[0][0]:
-        return None
-
-    # Update history (always, regardless of trigger). Use timestamp for proper time
-    # spacing — the IMC engine advances by 100 ts per call.
-    history = store.get("mids", [])
-    history.append([state.timestamp, mid])
-    # Drop entries older than 2x the lookback to bound memory
-    cutoff = state.timestamp - 2 * HP_DRIFT_LOOKBACK_TS
-    history = [h for h in history if h[0] >= cutoff]
-    if len(history) > HP_MID_HISTORY_MAX:
-        history = history[-HP_MID_HISTORY_MAX:]
-    store["mids"] = history
-
-    # Need a reference point at least HP_DRIFT_LOOKBACK_TS ago
-    ref_ts = state.timestamp - HP_DRIFT_LOOKBACK_TS
-    ref_mid = None
-    for h in history:
-        if h[0] <= ref_ts:
-            ref_mid = h[1]
-        else:
-            break
-    if ref_mid is None:
-        return None  # not enough history yet
-
-    drift = mid - ref_mid           # positive = mid rising over the window
-    # Adverse direction: if pos > 0 (long), adverse drift is mid FALLING (drift < 0).
-    # If pos < 0 (short), adverse drift is mid RISING (drift > 0).
-    if pos > 0:
-        adverse_drift = -drift      # long, falling = positive adverse
-    else:
-        adverse_drift = drift       # short, rising = positive adverse
-    if adverse_drift < HP_DRIFT_MIN_PTS:
-        return None  # drift not adverse enough
-
-    # Current z and signed-z (relative to position)
-    mean, sd = 9994, 32.588
-    z = (mid - mean) / sd
-    # signed_z: how much z still favors holding the current position.
-    # If short (pos < 0), z > 0 means "still want to be short" — favorable for holding.
-    # If long  (pos > 0), z < 0 means "still want to be long".
-    if pos < 0:
-        signed_z = z       # for shorts: positive z = still want to be short
-    else:
-        signed_z = -z      # for longs: negative z = still want to be long, flip sign
-
-    # Pick the most aggressive tier whose extension threshold we meet
-    tier = None
-    for ext_min, z_thresh, size in HP_EXIT_TIERS:
-        if extension >= ext_min:
-            tier = (ext_min, z_thresh, size)
-    if tier is None:
-        return None
-    ext_min, z_thresh, exit_size = tier
-
-    # Trigger only if signed_z is in the band (z_thresh, 1.0).
-    # Below z_thresh: not yet pinned-bleeding state.
-    # Above 1.0: still strong reversion signal, holding still has high EV.
-    # Inside the band: weak reversion + adverse drift = scale out.
-    if signed_z <= z_thresh or signed_z >= 1.0:
-        return None
-
-    # Also: don't fire if the imbalance is screaming in our favor — that means
-    # reversion may be imminent. Use the same threshold as the existing veto.
-    imb = _l1_imbalance(depth)
-    # Imbalance favorable to our position means: if short, imb < 0; if long, imb > 0.
-    favorable_imb = imb if pos > 0 else -imb
-    if favorable_imb > IMB_BOOST_THRESH:
-        return None  # market saying reversion is coming, hold the line
-
-    # Emit the exit order. Direction: opposite of current position sign.
     sym = "HYDROGEL_PACK"
-    if pos < 0:
-        # Short -> buy to cover. Walk the asks, take whatever's available.
-        target = min(exit_size, abs(pos))
-        orders, _ = _walk_book(depth, +1, sym, lambda px: True, target)
+    depth = state.order_depths.get(sym)
+    if not depth or not depth.buy_orders or not depth.sell_orders:
+        return []
+
+    best_bid = max(depth.buy_orders)
+    best_ask = min(depth.sell_orders)
+    if best_bid >= best_ask:
+        return []  # crossed/locked book, skip
+
+    mid = (best_bid + best_ask) / 2.0
+    pos = state.position.get(sym, 0)
+
+    # Sanity check: if mid is wildly off the long-run mean, the book is
+    # in some unusual state. Don't be a maker into possible regime change.
+    if abs(mid - HP_MEAN) > 100:
+        return []
+
+    # Decide offsets based on inventory direction
+    if pos > HP_SKEW_TRIGGER:
+        bid_off = HP_BASE_OFFSET + HP_SKEW_OFFSET   # 3
+        ask_off = HP_BASE_OFFSET                    # 1
+    elif pos < -HP_SKEW_TRIGGER:
+        bid_off = HP_BASE_OFFSET                    # 1
+        ask_off = HP_BASE_OFFSET + HP_SKEW_OFFSET   # 3
     else:
-        # Long -> sell. Walk the bids.
-        target = min(exit_size, pos)
-        orders, _ = _walk_book(depth, -1, sym, lambda px: True, target)
-    return orders if orders else None
+        bid_off = HP_BASE_OFFSET                    # 1
+        ask_off = HP_BASE_OFFSET                    # 1
+
+    # Compute quote prices, anchored to integer mid
+    import math
+    bid_px = int(math.floor(mid)) - bid_off
+    ask_px = int(math.ceil(mid)) + ask_off
+
+    # Don't cross our own quotes; don't quote at or past the touch.
+    # We want to be PASSIVE makers, not takers.
+    if bid_px >= best_ask:
+        bid_px = best_ask - 1
+    if ask_px <= best_bid:
+        ask_px = best_bid + 1
+    if bid_px >= ask_px:
+        return []
+
+    # Sizing: respect both soft and hard limits
+    # On the BID side (buying), we'd grow pos -> check upper limits
+    # On the ASK side (selling), we'd shrink pos -> check lower limits
+    bid_room = max(0, HP_HARD_LIMIT - pos)
+    ask_room = max(0, HP_HARD_LIMIT + pos)
+
+    # Soft limit: stop building past +/- SOFT_LIMIT
+    if pos >= HP_SOFT_LIMIT:
+        bid_size = 0
+    else:
+        bid_size = min(HP_BASE_SIZE, bid_room, HP_SOFT_LIMIT - pos)
+
+    if pos <= -HP_SOFT_LIMIT:
+        ask_size = 0
+    else:
+        ask_size = min(HP_BASE_SIZE, ask_room, HP_SOFT_LIMIT + pos)
+
+    # Imbalance veto: if book strongly favors a side, don't quote into it.
+    # imb > 0 means buyers winning at top of book -> aggressive buying ->
+    #   our ask is likely to get lifted by adverse takers. Skip ask.
+    # imb < 0 means sellers winning -> our bid is likely to be hit by adverse takers.
+    imb = _l1_imbalance(depth)
+    if imb > IMB_VETO_THRESH:
+        ask_size = 0
+    if imb < -IMB_VETO_THRESH:
+        bid_size = 0
+
+    orders = []
+    if bid_size > 0:
+        orders.append(Order(sym, bid_px, int(bid_size)))
+    if ask_size > 0:
+        orders.append(Order(sym, ask_px, -int(ask_size)))
+    return orders
 
 
 # ============================================================================
-# Per-product z-take with imbalance veto + boost (UNCHANGED from v4)
+# Per-product z-take (UNCHANGED from v4 — used for non-HP only)
 # ============================================================================
 
-def _z_take_orders(state, cfg, hp_store=None):
+def _z_take_orders(state, cfg):
     sym = cfg["symbol"]
     depth = state.order_depths.get(sym)
     if not depth or not depth.buy_orders or not depth.sell_orders:
@@ -327,14 +313,6 @@ def _z_take_orders(state, cfg, hp_store=None):
 
     pos = state.position.get(sym, 0)
     limit = cfg["limit"]
-
-    # ================ NEW: HP scale-out check (HP only) ================
-    if sym == "HYDROGEL_PACK" and hp_store is not None:
-        scale_out = _hp_check_scale_out(state, depth, mid, pos, limit, hp_store)
-        if scale_out is not None:
-            return scale_out
-    # ===================================================================
-
     base_thresh = cfg["z_thresh"]
     take_size = cfg["take_size"]
 
@@ -387,25 +365,17 @@ class Trader:
         return 0
 
     def run(self, state: TradingState):
-        # Load HP-only state. Everything else is stateless. If parsing fails,
-        # fall back to fresh state — degrades to v4 behavior, never crashes.
-        try:
-            store = json.loads(state.traderData) if state.traderData else {}
-            if not isinstance(store, dict):
-                store = {}
-        except Exception:
-            store = {}
-        hp_store = store.setdefault("HP", {})
-
         orders: dict[str, list[Order]] = {}
+
+        # HP: passive MM with bounded position
+        hp_ors = _hp_mm_orders(state)
+        if hp_ors:
+            orders["HYDROGEL_PACK"] = hp_ors
+
+        # Everything else: unchanged v4 z-take
         for cfg in CFGS:
-            ors = _z_take_orders(state, cfg, hp_store=hp_store if cfg["symbol"] == "HYDROGEL_PACK" else None)
+            ors = _z_take_orders(state, cfg)
             if ors:
                 orders[cfg["symbol"]] = ors
 
-        # Persist only HP state. Keep payload tiny.
-        try:
-            out_data = json.dumps(store, separators=(",", ":"))
-        except Exception:
-            out_data = ""
-        return orders, 0, out_data
+        return orders, 0, ""
